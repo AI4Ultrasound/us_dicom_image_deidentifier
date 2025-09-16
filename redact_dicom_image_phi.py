@@ -28,8 +28,136 @@ from pydicom.uid import ExplicitVRLittleEndian
 from pydicom.multival import MultiValue
 from pydicom.valuerep import PersonName
 from pydicom.tag import Tag
+from PIL import Image
 from presidio_analyzer import PatternRecognizer, Pattern
 from presidio_image_redactor.dicom_image_redactor_engine import DicomImageRedactorEngine
+from presidio_image_redactor.image_analyzer_engine import ImageRecognizerResult
+
+def _get_analyzer_results_patched(
+    self,
+    image: Image.Image,
+    instance: pydicom.dataset.FileDataset,
+    use_metadata: bool,
+    ocr_kwargs: Optional[dict],
+    ad_hoc_recognizers: Optional[List[PatternRecognizer]],
+    **text_analyzer_kwargs,
+) -> List[ImageRecognizerResult]:
+    """Analyze image with selected redaction approach.
+
+    :param image: DICOM pixel data as PIL image.
+    :param instance: DICOM instance (with metadata).
+    :param use_metadata: Whether to redact text in the image that
+    are present in the metadata.
+    :param ocr_kwargs: Additional params for OCR methods.
+    :param ad_hoc_recognizers: List of PatternRecognizer objects to use
+    for ad-hoc recognizer.
+    :param text_analyzer_kwargs: Additional values for the analyze method
+    in AnalyzerEngine (e.g., allow_list). Can include 'dicom_tags' list to
+    specify which DICOM tags to extract when use_metadata=True.
+
+    :return: Analyzer results.
+    """
+    # Check the ad-hoc recognizers list
+    self._check_ad_hoc_recognizer_list(ad_hoc_recognizers)
+
+    # Extract and filter out DICOM-specific parameters from text_analyzer_kwargs
+    specific_tags = None
+    if "dicom_tags" in text_analyzer_kwargs:
+        specific_tags = text_analyzer_kwargs["dicom_tags"]
+        # Filter out dicom_tags from text_analyzer_kwargs before passing to AnalyzerEngine
+        text_analyzer_kwargs = {k: v for k, v in text_analyzer_kwargs.items() if k != "dicom_tags"}
+
+    # Create custom recognizer using DICOM metadata
+    if use_metadata:
+        original_metadata, is_name, is_patient = self._get_text_metadata(instance, specific_tags)
+        phi_list = self._make_phi_list(original_metadata, is_name, is_patient)
+        deny_list_recognizer = PatternRecognizer(
+            supported_entity="PERSON", deny_list=phi_list
+        )
+
+        if ad_hoc_recognizers is None:
+            ad_hoc_recognizers = [deny_list_recognizer]
+        elif isinstance(ad_hoc_recognizers, list):
+            ad_hoc_recognizers.append(deny_list_recognizer)
+
+    # Detect PII
+    if ad_hoc_recognizers is None:
+        analyzer_results = self.image_analyzer_engine.analyze(
+            image,
+            ocr_kwargs=ocr_kwargs,
+            **text_analyzer_kwargs,
+        )
+    else:
+        analyzer_results = self.image_analyzer_engine.analyze(
+            image,
+            ocr_kwargs=ocr_kwargs,
+            ad_hoc_recognizers=ad_hoc_recognizers,
+            **text_analyzer_kwargs,
+        )
+
+    return analyzer_results
+
+def _get_text_metadata_patched(
+    instance: pydicom.dataset.FileDataset,
+    specific_tags: Optional[List[str]] = None,
+) -> Tuple[list, list, list]:
+    """Retrieve text metadata from the DICOM image.
+
+    :param instance: Loaded DICOM instance.
+    :param specific_tags: Optional list of DICOM tag names to extract.
+                            If None, extracts all tags (excluding pixel data).
+
+    :return: List of the instance's element values (excluding pixel data),
+    bool for if the element is specified as being a name,
+    bool for if the element is specified as being related to the patient.
+    """
+    metadata_text = list()
+    is_name = list()
+    is_patient = list()
+
+    # If specific tags are provided, only process those tags
+    if specific_tags is not None:
+        for tag_name in specific_tags:
+            if hasattr(instance, tag_name):
+                element = getattr(instance, tag_name)
+                metadata_text.append(element)
+
+                # Track whether this particular element is a name
+                if "name" in tag_name.lower():
+                    is_name.append(True)
+                else:
+                    is_name.append(False)
+
+                # Track whether this particular element is directly tied to the patient
+                if "patient" in tag_name.lower():
+                    is_patient.append(True)
+                else:
+                    is_patient.append(False)
+    else:
+        # Process all elements (original behavior)
+        for element in instance:
+            # Save all metadata except the DICOM image itself
+            if element.name != "Pixel Data":
+                # Save the metadata
+                metadata_text.append(element.value)
+
+                # Track whether this particular element is a name
+                if "name" in element.name.lower():
+                    is_name.append(True)
+                else:
+                    is_name.append(False)
+
+                # Track whether this particular element is directly tied to the patient
+                if "patient" in element.name.lower():
+                    is_patient.append(True)
+                else:
+                    is_patient.append(False)
+            else:
+                metadata_text.append("")
+                is_name.append(False)
+                is_patient.append(False)
+
+    return metadata_text, is_name, is_patient
 
 # --- Presidio DICOM engine monkey-patch: fix _make_phi_list ---
 def _make_phi_list_patched(
@@ -78,8 +206,42 @@ def _make_phi_list_patched(
             out.append(s)
     return out
 
+def _process_names_patched(cls, text_metadata: list, is_name: list) -> list:
+    """Process names to have multiple iterations in our PHI list.
+
+    :param text_metadata: List of all the instance's element values
+    (excluding pixel data).
+    :param is_name: True if the element is specified as being a name.
+
+    :return: Metadata text with additional name iterations appended.
+    """
+    phi_list = []
+
+    for i in range(0, len(text_metadata)):
+        if is_name[i] is True:
+            metadata_item = text_metadata[i]
+
+            # Handle MultiValue objects by processing each element individually
+            if isinstance(metadata_item, (MultiValue, list, tuple)):
+                for item in metadata_item:
+                    if item is None:
+                        continue
+                    original_text = str(item).strip()
+                    if original_text:
+                        phi_list.extend(cls.augment_word(original_text))
+            else:
+                # Handle single values
+                original_text = str(metadata_item).strip()
+                if original_text:
+                    phi_list.extend(cls.augment_word(original_text))
+
+    return phi_list
+
 # Apply the patch
+DicomImageRedactorEngine._get_analyzer_results = _get_analyzer_results_patched
+DicomImageRedactorEngine._get_text_metadata = staticmethod(_get_text_metadata_patched)
 DicomImageRedactorEngine._make_phi_list = classmethod(_make_phi_list_patched)
+DicomImageRedactorEngine._process_names = classmethod(_process_names_patched)
 # --- end monkey-patch ---
 
 # Set environment variables for deterministic behavior
@@ -666,13 +828,6 @@ def _set_conformance_attributes(ds: pydicom.Dataset, source_ds: pydicom.Dataset)
     if hasattr(ds, 'SamplesPerPixel') and ds.SamplesPerPixel == 3:
         ds.PlanarConfiguration = getattr(source_ds, 'PlanarConfiguration', 0)
 
-# REMOVED: dicom_header_to_dict - unused function
-
-# REMOVED: save_anonymized_dicom_header - unused function
-
-# REMOVED: _convert_to_json_compatible - unused function
-
-
 def _clamp_and_clean_boxes(boxes, *, width: int, height: int):
     cleaned = []
     for b in (boxes or []):  # ← nil-safe
@@ -933,6 +1088,7 @@ def redact_from_directory(
     fill: str = "contrast",
     patient_name_prefix: str = "anon",
     score_threshold: float = 0.0,
+    redact_metadata: bool = False,
     **text_analyzer_kwargs,
 ) -> List[Dict[str, str]]:
 
@@ -992,8 +1148,14 @@ def redact_from_directory(
 
                 try:
                     ds: FileDataset = pydicom.dcmread(str(src), stop_before_pixels=False, force=True)
-                    filename, patient_uid, _ = generate_filename_from_dicom_dataset(ds, True)
-                    new_patient_name = f"{patient_name_prefix}_{patient_uid}"
+                    if redact_metadata:
+                        filename, patient_uid, _ = generate_filename_from_dicom_dataset(ds, True)
+                        new_patient_name = f"{patient_name_prefix}_{patient_uid}"
+                    else:
+                        # Use original filename when metadata redaction is disabled
+                        filename = src.name
+                        patient_uid = ""
+                        new_patient_name = ""
                     dst_dcm = dst_dir / filename
                     dst_json = headers_subdir / (filename + "_bboxes.json")
 
@@ -1135,10 +1297,8 @@ def redact_from_directory(
                 finally:
                     # free large objects quickly
                     try:
-                        if ds is not None:
+                        if 'ds' in locals() and ds is not None:
                             del ds
-                        else:
-                            pass
                     except: pass
                     gc.collect()
 
@@ -1162,44 +1322,49 @@ def redact_from_directory(
                     else:
                         red_ds = _apply_union_and_conform(ds_src, boxes_union_px)
 
-                    # Capture original PHI data before replacing (JSON-safe)
-                    original_phi_data = {
-                        "PatientName": safe_get_attr(ds_src, "PatientName"),
-                        "PatientID": safe_get_attr(ds_src, "PatientID"),
-                        "PatientBirthDate": safe_get_attr(ds_src, "PatientBirthDate"),
-                        "OtherPatientIDs": get_other_patient_ids(ds_src),
-                        "ReferringPhysicianName": safe_get_attr(ds_src, "ReferringPhysicianName"),
-                        "AccessionNumber": safe_get_attr(ds_src, "AccessionNumber"),
-                        "StudyDate": safe_get_attr(ds_src, "StudyDate"),
-                        "SeriesDate": safe_get_attr(ds_src, "SeriesDate"),
-                        "ContentDate": safe_get_attr(ds_src, "ContentDate"),
-                        "StudyTime": safe_get_attr(ds_src, "StudyTime"),
-                        "SeriesTime": safe_get_attr(ds_src, "SeriesTime"),
-                        "ContentTime": safe_get_attr(ds_src, "ContentTime"),
-                    }
+                    # Apply metadata redaction only if requested
+                    if redact_metadata:
+                        # Capture original PHI data before replacing (JSON-safe)
+                        original_phi_data = {
+                            "PatientName": safe_get_attr(ds_src, "PatientName"),
+                            "PatientID": safe_get_attr(ds_src, "PatientID"),
+                            "PatientBirthDate": safe_get_attr(ds_src, "PatientBirthDate"),
+                            "OtherPatientIDs": get_other_patient_ids(ds_src),
+                            "ReferringPhysicianName": safe_get_attr(ds_src, "ReferringPhysicianName"),
+                            "AccessionNumber": safe_get_attr(ds_src, "AccessionNumber"),
+                            "StudyDate": safe_get_attr(ds_src, "StudyDate"),
+                            "SeriesDate": safe_get_attr(ds_src, "SeriesDate"),
+                            "ContentDate": safe_get_attr(ds_src, "ContentDate"),
+                            "StudyTime": safe_get_attr(ds_src, "StudyTime"),
+                            "SeriesTime": safe_get_attr(ds_src, "SeriesTime"),
+                            "ContentTime": safe_get_attr(ds_src, "ContentTime"),
+                        }
 
-                    # Replace PHI data with generated data
-                    red_ds.PatientName = f"{patient_name_prefix}_{mem['patient_uid']}" if mem["patient_uid"] else ""
-                    red_ds.PatientID = mem["patient_uid"] or ""
-                    red_ds.PatientBirthDate = ""
-                    red_ds.ReferringPhysicianName = ""
-                    red_ds.AccessionNumber = ""
-                    # Remove OtherPatientIDs (0010,1000) and OtherPatientIDsSequence (0010,1002) robustly
-                    from pydicom.tag import Tag
-                    _tag_opids = Tag(0x0010, 0x1000)
-                    _tag_opids_seq = Tag(0x0010, 0x1002)
-                    if _tag_opids in red_ds:
-                        del red_ds[_tag_opids]
-                    if _tag_opids_seq in red_ds:
-                        del red_ds[_tag_opids_seq]
-                    # Also delete by attribute name if present (covers keyword aliasing)
-                    for _attr in ("OtherPatientIDs", "RETIRED_OtherPatientIDs", "OtherPatientIDsSequence"):
-                        if hasattr(red_ds, _attr):
-                            try:
-                                delattr(red_ds, _attr)
-                            except Exception:
-                                pass
-                    _apply_date_shifting(red_ds, ds_src)
+                        # Replace PHI data with generated data
+                        red_ds.PatientName = f"{patient_name_prefix}_{mem['patient_uid']}" if mem["patient_uid"] else ""
+                        red_ds.PatientID = mem["patient_uid"] or ""
+                        red_ds.PatientBirthDate = ""
+                        red_ds.ReferringPhysicianName = ""
+                        red_ds.AccessionNumber = ""
+                        # Remove OtherPatientIDs (0010,1000) and OtherPatientIDsSequence (0010,1002) robustly
+                        from pydicom.tag import Tag
+                        _tag_opids = Tag(0x0010, 0x1000)
+                        _tag_opids_seq = Tag(0x0010, 0x1002)
+                        if _tag_opids in red_ds:
+                            del red_ds[_tag_opids]
+                        if _tag_opids_seq in red_ds:
+                            del red_ds[_tag_opids_seq]
+                        # Also delete by attribute name if present (covers keyword aliasing)
+                        for _attr in ("OtherPatientIDs", "RETIRED_OtherPatientIDs", "OtherPatientIDsSequence"):
+                            if hasattr(red_ds, _attr):
+                                try:
+                                    delattr(red_ds, _attr)
+                                except Exception:
+                                    pass
+                        _apply_date_shifting(red_ds, ds_src)
+                    else:
+                        # When metadata redaction is disabled, keep original PHI data
+                        original_phi_data = {}
                     _set_conformance_attributes(red_ds, ds_src)
 
                     pydicom.dcmwrite(out_path, red_ds, write_like_original=False, little_endian=True, implicit_vr=False)
@@ -1215,7 +1380,7 @@ def redact_from_directory(
                                     "leaf_union": True,
                                     "leaf_key": lk,
                                     "transducer_signature": probe_key,
-                                    "phi": original_phi_data
+                                    "phi": original_phi_data if redact_metadata else {}
                                 }, f, indent=2, ensure_ascii=False, default=str)
                         except Exception as e:
                             print(f"Warning: Failed to write JSON for {mem['src_path']}: {e}")
@@ -1251,7 +1416,10 @@ def redact_from_directory(
                     print(f"[ERR apply union {lk} | {probe_key}] {out_path} after {dt_ms:.1f} ms: {e}")
                 finally:
                     try:
-                        del ds_src, red_ds
+                        if 'ds_src' in locals():
+                            del ds_src
+                        if 'red_ds' in locals():
+                            del red_ds
                     except:
                         pass
                     gc.collect()
@@ -1742,6 +1910,7 @@ def main():
     parser.add_argument("--merge-iou", type=float, default=0.2)
     parser.add_argument("--expand", type=int, default=8)
     parser.add_argument("--patient-prefix", default="anon")
+    parser.add_argument("--redact-metadata", action="store_true", default=False, help="Redact metadata and rename output files")
     parser.add_argument("--random-text", action="store_true", default=False, help="Insert random text into boxes")
     parser.add_argument("--text-bold", action="store_true", default=False, help="Make text bold (may cause slight blur)")
     parser.add_argument("--pdf-report", type=str, help="Generate PDF comparison report (specify output path)")
@@ -1760,10 +1929,12 @@ def main():
         top_ratio=args.top_ratio, bottom_ratio=args.bottom_ratio,
         left_ratio=args.left_ratio, right_ratio=args.right_ratio,
         padding_width=args.padding, expand_margin=args.expand,
+        redact_metadata=args.redact_metadata,
         ocr_kwargs={
             "config": "--oem 1 --psm 6 -c tessedit_do_invert=0 preserve_interword_spaces=1 tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789:/.-"
         },  # e.g. tesseract config
         # text_analyzer_kwargs passed to ImageAnalyzerEngine.analyze_image():
+        dicom_tags=["PatientName", "PatientID", "PatientBirthDate", "OtherPatientIDs", "ReferringPhysicianName", "InstitutionName", "AccessionNumber", "StudyDate", "SeriesDate", "ContentDate", "StudyTime", "SeriesTime", "ContentTime"],
         entities=["PERSON", "DATE_TIME"],
         language="en",
     )
