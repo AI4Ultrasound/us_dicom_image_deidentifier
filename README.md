@@ -9,8 +9,10 @@ A comprehensive tool for deidentifying DICOM medical images by detecting and red
 - **Metadata Anonymization**: Replaces patient identifiers, dates, and other PHI in DICOM headers
 - **Flexible Redaction**: Configurable margin-based detection with customizable ROI ratios
 - **Batch Processing**: Process entire directories of DICOM files recursively
+- **Google Cloud Storage Integration**: Stream processing directly from/to GCS buckets with minimal local storage usage
 - **Visual Reports**: Generate PDF comparison reports showing original vs redacted images
 - **Random Text Replacement**: Optionally replace redacted areas with random text for better visual appearance
+- **Selective Metadata Redaction**: Choose whether to redact metadata or preserve original filenames and headers
 
 ## Installation
 
@@ -182,11 +184,30 @@ tesseract 5.3.0
 
 ### Basic Usage
 
+#### Local File Processing
+
 ```bash
 python redact_dicom_image_phi.py \
     --input /path/to/dicom/files \
     --output /path/to/output/directory \
     --headers /path/to/headers/directory
+```
+
+#### Google Cloud Storage Processing
+
+```bash
+# GCS Streaming Mode (recommended for large datasets)
+python redact_dicom_image_phi.py \
+    --input gs://my-bucket/input/ \
+    --output gs://my-bucket/output/ \
+    --headers gs://my-bucket/headers/ \
+    --redact-metadata
+
+# Mixed local/GCS processing
+python redact_dicom_image_phi.py \
+    --input gs://my-bucket/input/ \
+    --output /tmp/output/ \
+    --headers /tmp/headers/
 ```
 
 ### Advanced Options
@@ -241,25 +262,26 @@ This configuration:
 
 ### Command Line Arguments
 
-| Argument           | Description                                          | Default  |
-| ------------------ | ---------------------------------------------------- | -------- |
-| `--input`          | Path to input DICOM file or directory                | Required |
-| `--output`         | Output directory for redacted DICOM files            | Required |
-| `--headers`        | Directory for storing bbox JSON metadata             | Required |
-| `--recursive`      | Process subdirectories recursively                   | True     |
-| `--overwrite`      | Overwrite existing output files                      | False    |
-| `--samples`        | Number of frames to sample for multi-frame detection | 5        |
-| `--top-ratio`      | Ratio of image height for top margin detection       | 0.25     |
-| `--bottom-ratio`   | Ratio of image height for bottom margin detection    | 0.25     |
-| `--left-ratio`     | Ratio of image width for left margin detection       | 0.25     |
-| `--right-ratio`    | Ratio of image width for right margin detection      | 0.25     |
-| `--padding`        | Padding width around detected text                   | 8        |
-| `--merge-iou`      | IoU threshold for merging overlapping boxes          | 0.2      |
-| `--expand`         | Margin expansion around merged boxes                 | 8        |
-| `--patient-prefix` | Prefix for anonymized patient names                  | "anon"   |
-| `--random-text`    | Add random text to redacted areas                    | False    |
-| `--text-bold`      | Make replacement text bold                           | False    |
-| `--pdf-report`     | Generate PDF comparison report                       | None     |
+| Argument            | Description                                                | Default  |
+| ------------------- | ---------------------------------------------------------- | -------- |
+| `--input`           | Path to input DICOM file or directory (supports gs://)     | Required |
+| `--output`          | Output directory for redacted DICOM files (supports gs://) | Required |
+| `--headers`         | Directory for storing bbox JSON metadata (supports gs://)  | Required |
+| `--recursive`       | Process subdirectories recursively                         | True     |
+| `--overwrite`       | Overwrite existing output files                            | False    |
+| `--samples`         | Number of frames to sample for multi-frame detection       | 5        |
+| `--top-ratio`       | Ratio of image height for top margin detection             | 0.25     |
+| `--bottom-ratio`    | Ratio of image height for bottom margin detection          | 0.25     |
+| `--left-ratio`      | Ratio of image width for left margin detection             | 0.25     |
+| `--right-ratio`     | Ratio of image width for right margin detection            | 0.25     |
+| `--padding`         | Padding width around detected text                         | 8        |
+| `--merge-iou`       | IoU threshold for merging overlapping boxes                | 0.2      |
+| `--expand`          | Margin expansion around merged boxes                       | 8        |
+| `--patient-prefix`  | Prefix for anonymized patient names                        | "anon"   |
+| `--redact-metadata` | Redact metadata and rename output files                    | False    |
+| `--random-text`     | Add random text to redacted areas                          | False    |
+| `--text-bold`       | Make replacement text bold                                 | False    |
+| `--pdf-report`      | Generate PDF comparison report                             | None     |
 
 ## How It Works
 
@@ -288,6 +310,55 @@ This configuration:
 - Creates anonymized DICOM files with redacted pixel data
 - Generates JSON metadata files containing redaction information
 - Optionally creates PDF comparison reports
+
+## Google Cloud Storage Integration
+
+The tool supports two processing modes for GCS integration:
+
+### GCS Streaming Mode (Recommended)
+
+**Triggers when**: All three paths (input, output, headers) are GCS paths (`gs://`)
+
+- **Minimal Local Storage**: Processes files one at a time, only one file exists locally at any time
+- **Scalable**: Can handle datasets of any size without running out of disk space
+- **Efficient**: Downloads → processes → uploads → deletes for each file individually
+- **Automatic**: No additional configuration needed when using all GCS paths
+
+### Traditional Mode (Fallback)
+
+**Triggers when**: Any path is local or mixed local/GCS
+
+- Downloads entire directories from GCS to local storage
+- Processes all files locally
+- Uploads results back to GCS
+- Requires sufficient local disk space for the entire dataset
+
+### GCS Prerequisites
+
+1. **GCP Compute Engine Instance**: Run on a Compute Engine instance with appropriate permissions
+2. **Service Account Permissions**:
+   - `Storage Object Viewer` role for reading from input buckets
+   - `Storage Object Creator` role for writing to output buckets
+3. **Authentication**: Uses default service account (automatic on Compute Engine)
+
+### GCS Usage Examples
+
+```bash
+# Full GCS streaming (most efficient)
+python redact_dicom_image_phi.py \
+    --input gs://my-bucket/input/ \
+    --output gs://my-bucket/output/ \
+    --headers gs://my-bucket/headers/ \
+    --redact-metadata
+
+# Mixed local/GCS (traditional mode)
+python redact_dicom_image_phi.py \
+    --input gs://my-bucket/input/ \
+    --output /tmp/output/ \
+    --headers /tmp/headers/
+```
+
+For detailed GCS setup instructions, see [GCS_SETUP.md](GCS_SETUP.md).
 
 ## Output Structure
 
@@ -365,6 +436,7 @@ Key dependencies include:
 - `pytesseract`: OCR functionality
 - `matplotlib`: PDF report generation
 - `spacy`: Natural language processing for PHI detection
+- `google-cloud-storage`: Google Cloud Storage integration
 
 ## License
 
