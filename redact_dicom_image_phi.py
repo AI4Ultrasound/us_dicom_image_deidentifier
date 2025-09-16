@@ -32,6 +32,9 @@ from PIL import Image
 from presidio_analyzer import PatternRecognizer, Pattern
 from presidio_image_redactor.dicom_image_redactor_engine import DicomImageRedactorEngine
 from presidio_image_redactor.image_analyzer_engine import ImageRecognizerResult
+from google.cloud import storage
+import tempfile
+import shutil
 
 def _get_analyzer_results_patched(
     self,
@@ -259,6 +262,62 @@ PATIENT_ID_HASH_LENGTH = 10
 INSTANCE_ID_HASH_LENGTH = 8
 DEFAULT_CONTENT_DATE = '19000101'
 DEFAULT_CONTENT_TIME = ''
+
+# GCS helper functions
+def list_gcs_files(bucket_name: str, prefix: str, valid_exts: tuple = (".dcm", ".DCM")) -> list:
+    """List all DICOM files in a GCS bucket prefix."""
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+
+    files = []
+    blobs = bucket.list_blobs(prefix=prefix)
+    for blob in blobs:
+        if blob.name.endswith('/'):  # Skip directory markers
+            continue
+
+        # Check if file has valid extension
+        if any(blob.name.lower().endswith(ext.lower()) for ext in valid_exts):
+            files.append(blob)
+
+    return files
+
+def download_gcs_file_to_temp(blob) -> str:
+    """Download a single GCS blob to a temporary file and return the path."""
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix='.dcm')
+    blob.download_to_filename(temp_file.name)
+    return temp_file.name
+
+def upload_file_to_gcs(local_file_path: str, bucket_name: str, blob_name: str) -> None:
+    """Upload a single file to GCS."""
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(blob_name)
+    blob.upload_from_filename(local_file_path)
+    print(f"Uploaded: {local_file_path} -> gs://{bucket_name}/{blob_name}")
+
+def upload_string_to_gcs(content: str, bucket_name: str, blob_name: str) -> None:
+    """Upload string content to GCS."""
+    client = storage.Client()
+    bucket = client.bucket(bucket_name)
+    blob = bucket.blob(blob_name)
+    blob.upload_from_string(content)
+    print(f"Uploaded string content -> gs://{bucket_name}/{blob_name}")
+
+def is_gcs_path(path: str) -> bool:
+    """Check if a path is a GCS path (gs://bucket/prefix)."""
+    return path.startswith('gs://')
+
+def parse_gcs_path(gcs_path: str) -> tuple[str, str]:
+    """Parse a GCS path into bucket name and prefix."""
+    if not gcs_path.startswith('gs://'):
+        raise ValueError(f"Invalid GCS path: {gcs_path}")
+
+    path_without_gs = gcs_path[5:]  # Remove 'gs://'
+    parts = path_without_gs.split('/', 1)
+    bucket_name = parts[0]
+    prefix = parts[1] if len(parts) > 1 else ''
+
+    return bucket_name, prefix
 
 def force_explicit_vr_le(ds):
     ds.file_meta = ds.file_meta or Dataset()
@@ -1066,6 +1125,242 @@ def get_other_patient_ids(ds) -> list | str:
     if len(out) == 1:
         return out[0]
     return out
+
+def redact_from_gcs(
+    input_bucket: str,
+    input_prefix: str,
+    output_bucket: str,
+    output_prefix: str,
+    headers_bucket: str,
+    headers_prefix: str,
+    engine,
+    valid_exts: Tuple[str, ...] = (".dcm", ".DCM"),
+    overwrite: bool = True,
+    # margin-union tuning:
+    samples: int = 5,
+    top_ratio: float = 0.25, bottom_ratio: float = 0.25,
+    left_ratio: float = 0.25, right_ratio: float = 0.25,
+    padding_width: int = 8,
+    merge_iou: float = 0.2,
+    expand_margin: int = 6,
+    # engine / analyzer:
+    ocr_kwargs=None,
+    ad_hoc_recognizers=None,
+    fill: str = "contrast",
+    patient_name_prefix: str = "anon",
+    score_threshold: float = 0.0,
+    redact_metadata: bool = False,
+    **text_analyzer_kwargs,
+) -> List[Dict[str, str]]:
+    """Process DICOM files directly from GCS without downloading all files locally."""
+
+    # List all DICOM files in the input bucket
+    input_files = list_gcs_files(input_bucket, input_prefix, valid_exts)
+    print(f"Found {len(input_files)} DICOM files in gs://{input_bucket}/{input_prefix}")
+
+    dicom_pairs: List[Dict[str, str]] = []
+    processed, skipped, errored = 0, 0, 0
+    temp_files = []  # Track temporary files for cleanup
+
+    try:
+        for blob in input_files:
+            temp_file_path = None
+            try:
+                # Download single file to temporary location
+                temp_file_path = download_gcs_file_to_temp(blob)
+                temp_files.append(temp_file_path)
+
+                # Determine output paths
+                relative_path = blob.name[len(input_prefix):].lstrip('/')
+                output_blob_name = f"{output_prefix.rstrip('/')}/{relative_path}"
+                headers_blob_name = f"{headers_prefix.rstrip('/')}/{relative_path}_bboxes.json"
+
+                # Check if output already exists (if not overwriting)
+                if not overwrite:
+                    client = storage.Client()
+                    output_bucket_obj = client.bucket(output_bucket)
+                    if output_bucket_obj.blob(output_blob_name).exists():
+                        skipped += 1
+                        print(f"[SKIP] {blob.name} -> output already exists")
+                        continue
+
+                # Process the single file
+                print(f"Processing: {blob.name}")
+                result = redact_single_dicom_file(
+                    temp_file_path,
+                    engine,
+                    samples=samples,
+                    top_ratio=top_ratio, bottom_ratio=bottom_ratio,
+                    left_ratio=left_ratio, right_ratio=right_ratio,
+                    padding_width=padding_width, expand_margin=expand_margin,
+                    ocr_kwargs=ocr_kwargs, ad_hoc_recognizers=ad_hoc_recognizers,
+                    fill=fill, patient_name_prefix=patient_name_prefix,
+                    score_threshold=score_threshold, redact_metadata=redact_metadata,
+                    **text_analyzer_kwargs
+                )
+
+                if result:
+                    # Upload processed DICOM file
+                    upload_file_to_gcs(result['output_path'], output_bucket, output_blob_name)
+
+                    # Upload JSON metadata if headers bucket is specified
+                    if headers_bucket and result.get('json_path'):
+                        upload_file_to_gcs(result['json_path'], headers_bucket, headers_blob_name)
+
+                    # Create entry for dicom_pairs
+                    entry = {
+                        "rel_input": relative_path,
+                        "source": f"gs://{input_bucket}/{blob.name}",
+                        "output": f"gs://{output_bucket}/{output_blob_name}",
+                        "num_frames": result.get('num_frames', 1),
+                        "boxes": result.get('boxes', []),
+                    }
+                    if headers_bucket:
+                        entry["boxes_json"] = f"gs://{headers_bucket}/{headers_blob_name}"
+                    dicom_pairs.append(entry)
+
+                    processed += 1
+                    print(f"[SUCCESS] {blob.name} -> {output_blob_name}")
+                else:
+                    errored += 1
+                    print(f"[ERROR] Failed to process {blob.name}")
+
+            except Exception as e:
+                errored += 1
+                print(f"[ERROR] {blob.name}: {e}")
+            finally:
+                # Clean up temporary file immediately
+                if temp_file_path and Path(temp_file_path).exists():
+                    Path(temp_file_path).unlink()
+                    if temp_file_path in temp_files:
+                        temp_files.remove(temp_file_path)
+
+    finally:
+        # Clean up any remaining temporary files
+        for temp_file in temp_files:
+            if Path(temp_file).exists():
+                Path(temp_file).unlink()
+
+    print(f"\nGCS Processing Summary:")
+    print(f"Processed: {processed}, Skipped: {skipped}, Errored: {errored}")
+    return dicom_pairs
+
+def redact_single_dicom_file(
+    input_file: str,
+    engine,
+    samples: int = 5,
+    top_ratio: float = 0.25, bottom_ratio: float = 0.25,
+    left_ratio: float = 0.25, right_ratio: float = 0.25,
+    padding_width: int = 8,
+    merge_iou: float = 0.2,
+    expand_margin: int = 6,
+    ocr_kwargs=None,
+    ad_hoc_recognizers=None,
+    fill: str = "contrast",
+    patient_name_prefix: str = "anon",
+    score_threshold: float = 0.0,
+    redact_metadata: bool = False,
+    **text_analyzer_kwargs,
+) -> Optional[Dict]:
+    """Process a single DICOM file and return results."""
+
+    try:
+        # Read DICOM file
+        ds: FileDataset = pydicom.dcmread(input_file, stop_before_pixels=False, force=True)
+
+        # Generate filename
+        if redact_metadata:
+            filename, patient_uid, _ = generate_filename_from_dicom_dataset(ds, True)
+            new_patient_name = f"{patient_name_prefix}_{patient_uid}"
+        else:
+            filename = Path(input_file).name
+            patient_uid = ""
+            new_patient_name = ""
+
+        # Create temporary output files
+        temp_output = tempfile.NamedTemporaryFile(delete=False, suffix='.dcm')
+        temp_json = tempfile.NamedTemporaryFile(delete=False, suffix='.json')
+
+        # Process the DICOM file
+        n = int(getattr(ds, "NumberOfFrames", 1))
+        if n > 1:
+            print(f"    Using ROI processing path ({n} frames)")
+            _, boxes = redact_multiframe_margin_union(
+                ds, engine,
+                samples=samples,
+                top_ratio=top_ratio, bottom_ratio=bottom_ratio,
+                left_ratio=left_ratio, right_ratio=right_ratio,
+                padding_width=padding_width,
+                merge_iou=merge_iou,
+                expand_margin=expand_margin,
+                fill=fill,
+                ocr_kwargs=ocr_kwargs,
+                ad_hoc_recognizers=ad_hoc_recognizers,
+                score_threshold=score_threshold,
+                **text_analyzer_kwargs,
+            )
+        else:
+            print(f"    Using fallback path (single frame)")
+            _, boxes = engine.redact_and_return_bbox(
+                deepcopy(ds), fill=fill, padding_width=padding_width,
+                use_metadata=True, ocr_kwargs=ocr_kwargs,
+                ad_hoc_recognizers=ad_hoc_recognizers,
+                score_threshold=score_threshold,
+                **text_analyzer_kwargs
+            )
+
+        boxes = boxes or []
+        H, W = int(ds.Rows), int(ds.Columns)
+        clean_boxes = _clamp_and_clean_boxes(boxes, width=W, height=H)
+
+        # Apply metadata redaction if requested
+        if redact_metadata:
+            # Apply metadata redaction logic here
+            ds.PatientName = new_patient_name if patient_uid else ""
+            ds.PatientID = patient_uid or ""
+            ds.PatientBirthDate = ""
+            ds.ReferringPhysicianName = ""
+            ds.AccessionNumber = ""
+            # Remove OtherPatientIDs
+            from pydicom.tag import Tag
+            _tag_opids = Tag(0x0010, 0x1000)
+            _tag_opids_seq = Tag(0x0010, 0x1002)
+            if _tag_opids in ds:
+                del ds[_tag_opids]
+            if _tag_opids_seq in ds:
+                del ds[_tag_opids_seq]
+            _apply_date_shifting(ds, ds)
+
+        _set_conformance_attributes(ds, ds)
+
+        # Save processed DICOM
+        pydicom.dcmwrite(temp_output.name, ds, write_like_original=False, little_endian=True, implicit_vr=False)
+
+        # Save JSON metadata
+        json_data = {
+            "source": input_file,
+            "output": temp_output.name,
+            "num_frames": n,
+            "boxes": clean_boxes,
+            "phi": {} if not redact_metadata else {
+                "PatientName": getattr(ds, "PatientName", ""),
+                "PatientID": getattr(ds, "PatientID", ""),
+            }
+        }
+
+        with open(temp_json.name, "w") as f:
+            json.dump(json_data, f, indent=2, ensure_ascii=False, default=str)
+
+        return {
+            "output_path": temp_output.name,
+            "json_path": temp_json.name,
+            "num_frames": n,
+            "boxes": clean_boxes
+        }
+
+    except Exception as e:
+        print(f"Error processing {input_file}: {e}")
+        return None
 
 def redact_from_directory(
     input_dicom_path: str,
@@ -1896,9 +2191,9 @@ Red boxes on the original image show the areas that were detected for redaction.
 
 def main():
     parser = argparse.ArgumentParser(description="Leaf+transducer union redaction for DICOM clips.")
-    parser.add_argument("--input", required=True, help="Path to input DICOM or directory")
-    parser.add_argument("--output", required=True, help="Output directory")
-    parser.add_argument("--headers", required=True, help="Directory for bbox JSONs")
+    parser.add_argument("--input", required=True, help="Path to input DICOM or directory (supports gs://bucket/prefix)")
+    parser.add_argument("--output", required=True, help="Output directory (supports gs://bucket/prefix)")
+    parser.add_argument("--headers", required=True, help="Directory for bbox JSONs (supports gs://bucket/prefix)")
     parser.add_argument("--recursive", action="store_true", default=True, help="Recurse into subdirectories")
     parser.add_argument("--overwrite", action="store_true", default=False, help="Overwrite outputs if exist")
     parser.add_argument("--samples", type=int, default=5)
@@ -1916,28 +2211,143 @@ def main():
     parser.add_argument("--pdf-report", type=str, help="Generate PDF comparison report (specify output path)")
     args = parser.parse_args()
 
+    # Handle GCS vs local paths
     engine = get_engine()
-    dicom_pairs = redact_from_directory(
-        input_dicom_path=args.input,
-        output_dir=args.output,
-        headers_dir=args.headers,
-        engine=engine,                # your DicomImageRedactorEngine
-        recursive=args.recursive,
-        overwrite=args.overwrite,
-        # tune these if margins vary:
-        samples=args.samples,
-        top_ratio=args.top_ratio, bottom_ratio=args.bottom_ratio,
-        left_ratio=args.left_ratio, right_ratio=args.right_ratio,
-        padding_width=args.padding, expand_margin=args.expand,
-        redact_metadata=args.redact_metadata,
-        ocr_kwargs={
-            "config": "--oem 1 --psm 6 -c tessedit_do_invert=0 preserve_interword_spaces=1 tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789:/.-"
-        },  # e.g. tesseract config
-        # text_analyzer_kwargs passed to ImageAnalyzerEngine.analyze_image():
-        dicom_tags=["PatientName", "PatientID", "PatientBirthDate", "OtherPatientIDs", "ReferringPhysicianName", "InstitutionName", "AccessionNumber", "StudyDate", "SeriesDate", "ContentDate", "StudyTime", "SeriesTime", "ContentTime"],
-        entities=["PERSON", "DATE_TIME"],
-        language="en",
-    )
+
+    # Check if we're doing full GCS processing (input, output, and headers all from/to GCS)
+    if (is_gcs_path(args.input) and is_gcs_path(args.output) and is_gcs_path(args.headers)):
+        print("Using GCS streaming mode (processing files one at a time)")
+        input_bucket, input_prefix = parse_gcs_path(args.input)
+        output_bucket, output_prefix = parse_gcs_path(args.output)
+        headers_bucket, headers_prefix = parse_gcs_path(args.headers)
+
+        dicom_pairs = redact_from_gcs(
+            input_bucket=input_bucket,
+            input_prefix=input_prefix,
+            output_bucket=output_bucket,
+            output_prefix=output_prefix,
+            headers_bucket=headers_bucket,
+            headers_prefix=headers_prefix,
+            engine=engine,
+            overwrite=args.overwrite,
+            samples=args.samples,
+            top_ratio=args.top_ratio, bottom_ratio=args.bottom_ratio,
+            left_ratio=args.left_ratio, right_ratio=args.right_ratio,
+            padding_width=args.padding, expand_margin=args.expand,
+            redact_metadata=args.redact_metadata,
+            ocr_kwargs={
+                "config": "--oem 1 --psm 6 -c tessedit_do_invert=0 preserve_interword_spaces=1 tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789:/.-"
+            },
+            dicom_tags=["PatientName", "PatientID", "PatientBirthDate", "OtherPatientIDs", "ReferringPhysicianName", "InstitutionName", "AccessionNumber", "StudyDate", "SeriesDate", "ContentDate", "StudyTime", "SeriesTime", "ContentTime"],
+            entities=["PERSON", "DATE_TIME"],
+            language="en",
+        )
+    else:
+        # Fall back to the original approach for mixed local/GCS or all local
+        print("Using traditional mode (downloading/uploading directories)")
+        temp_dirs = []
+        # Initialize GCS variables in case we're not using GCS
+        output_bucket = output_prefix = headers_bucket = headers_prefix = None
+
+        try:
+            # Process input path
+            if is_gcs_path(args.input):
+                print(f"Downloading input from GCS: {args.input}")
+                bucket_name, prefix = parse_gcs_path(args.input)
+                temp_input_dir = tempfile.mkdtemp(prefix="gcs_input_")
+                temp_dirs.append(temp_input_dir)
+                # Use the old download function for full directory download
+                from google.cloud import storage
+                client = storage.Client()
+                bucket = client.bucket(bucket_name)
+                Path(temp_input_dir).mkdir(parents=True, exist_ok=True)
+                blobs = bucket.list_blobs(prefix=prefix)
+                for blob in blobs:
+                    if blob.name.endswith('/'):
+                        continue
+                    relative_path = blob.name[len(prefix):].lstrip('/')
+                    local_file_path = Path(temp_input_dir) / relative_path
+                    local_file_path.parent.mkdir(parents=True, exist_ok=True)
+                    blob.download_to_filename(str(local_file_path))
+                input_path = temp_input_dir
+            else:
+                input_path = args.input
+
+            # Process output path
+            if is_gcs_path(args.output):
+                temp_output_dir = tempfile.mkdtemp(prefix="gcs_output_")
+                temp_dirs.append(temp_output_dir)
+                output_path = temp_output_dir
+                output_is_gcs = True
+                output_bucket, output_prefix = parse_gcs_path(args.output)
+            else:
+                output_path = args.output
+                output_is_gcs = False
+
+            # Process headers path
+            if is_gcs_path(args.headers):
+                temp_headers_dir = tempfile.mkdtemp(prefix="gcs_headers_")
+                temp_dirs.append(temp_headers_dir)
+                headers_path = temp_headers_dir
+                headers_is_gcs = True
+                headers_bucket, headers_prefix = parse_gcs_path(args.headers)
+            else:
+                headers_path = args.headers
+                headers_is_gcs = False
+
+            dicom_pairs = redact_from_directory(
+                input_dicom_path=input_path,
+                output_dir=output_path,
+                headers_dir=headers_path,
+                engine=engine,
+                recursive=args.recursive,
+                overwrite=args.overwrite,
+                samples=args.samples,
+                top_ratio=args.top_ratio, bottom_ratio=args.bottom_ratio,
+                left_ratio=args.left_ratio, right_ratio=args.right_ratio,
+                padding_width=args.padding, expand_margin=args.expand,
+                redact_metadata=args.redact_metadata,
+                ocr_kwargs={
+                    "config": "--oem 1 --psm 6 -c tessedit_do_invert=0 preserve_interword_spaces=1 tessedit_char_whitelist=ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789:/.-"
+                },
+                dicom_tags=["PatientName", "PatientID", "PatientBirthDate", "OtherPatientIDs", "ReferringPhysicianName", "InstitutionName", "AccessionNumber", "StudyDate", "SeriesDate", "ContentDate", "StudyTime", "SeriesTime", "ContentTime"],
+                entities=["PERSON", "DATE_TIME"],
+                language="en",
+            )
+
+            # Upload results to GCS if needed
+            if output_is_gcs:
+                print(f"Uploading output to GCS: {args.output}")
+                from google.cloud import storage
+                client = storage.Client()
+                bucket = client.bucket(output_bucket)
+                local_path = Path(output_path)
+                for file_path in local_path.rglob('*'):
+                    if file_path.is_file():
+                        relative_path = file_path.relative_to(local_path)
+                        blob_name = f"{output_prefix.rstrip('/')}/{relative_path.as_posix()}"
+                        blob = bucket.blob(blob_name)
+                        blob.upload_from_filename(str(file_path))
+
+            if headers_is_gcs:
+                print(f"Uploading headers to GCS: {args.headers}")
+                from google.cloud import storage
+                client = storage.Client()
+                bucket = client.bucket(headers_bucket)
+                local_path = Path(headers_path)
+                for file_path in local_path.rglob('*'):
+                    if file_path.is_file():
+                        relative_path = file_path.relative_to(local_path)
+                        blob_name = f"{headers_prefix.rstrip('/')}/{relative_path.as_posix()}"
+                        blob = bucket.blob(blob_name)
+                        blob.upload_from_filename(str(file_path))
+
+        finally:
+            # Clean up temporary directories
+            for temp_dir in temp_dirs:
+                if Path(temp_dir).exists():
+                    shutil.rmtree(temp_dir)
+                    print(f"Cleaned up temporary directory: {temp_dir}")
 
     print(f"Redacted {len(dicom_pairs)} items.")
 
